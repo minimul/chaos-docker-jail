@@ -1,0 +1,163 @@
+#!/bin/bash
+# chaos-docker-jail - run seuros/chaos (https://github.com/seuros/chaos)
+# inside a sandboxed Docker container.
+#
+# This script is based on the local claude-jail wrapper, but is tailored for
+# Chaos. In Claude MAX mode, Chaos shells out to Claude Code, so we reuse the
+# host's Claude auth directory to preserve login state across runs. Chaos state
+# is stored separately under ~/.chaos-home.
+set -eo pipefail
+
+IMAGE_NAME="chaos-docker-jail"
+HOST_PWD="$(pwd)"
+SCRIPT_PATH="$(readlink -f "$0")"
+CHAOS_REF="${CHAOS_REF:-master}"
+FORCE_REBUILD=false
+NO_CACHE=false
+SHELL_MODE=false
+SAFE_MODE=false
+PASSTHROUGH_ARGS=()
+ENV_VARS=()
+: "${USER:=$(id -un)}"
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --rebuild|-r) FORCE_REBUILD=true; shift ;;
+        --no-cache)   NO_CACHE=true; shift ;;
+        --shell|-s)   SHELL_MODE=true; shift ;;
+        --safe)       SAFE_MODE=true; shift ;;
+        -e|--env)
+            [ -z "${2:-}" ] && { echo "Error: $1 requires KEY=VALUE" >&2; exit 1; }
+            ENV_VARS+=("$2"); shift 2 ;;
+        --help|-h)
+            cat <<EOF
+Usage: $0 [OPTIONS] [-- CHAOS_ARGS...]
+
+Options:
+  -e, --env KEY=VAL   Pass env var to the container (repeatable)
+  -r, --rebuild       Force rebuild of the Docker image
+      --no-cache      Rebuild without Docker cache
+  -s, --shell         Start a bash shell instead of chaos
+      --safe          Disable default YOLO mode
+  -h, --help          Show this help
+
+Environment:
+  CHAOS_REF           git ref of seuros/chaos to build (default: master)
+
+Mounts:
+  \$HOME/.claude-home  -> /home/node/.claude  (shared Claude auth state)
+  \$HOME/.chaos-home   -> /home/node/.chaos
+  \$(pwd)              -> \$(pwd)              (workspace)
+EOF
+            exit 0 ;;
+        --) shift; PASSTHROUGH_ARGS+=("$@"); break ;;
+        *)  echo "Error: Unknown option '$1'" >&2; exit 1 ;;
+    esac
+done
+
+# Shared Claude auth state from the host.
+claude_data="$HOME/.claude-home"
+mkdir -p "$claude_data/.claude"
+touch "$claude_data/.claude.json"
+
+# Persistent Chaos state on the host.
+chaos_data="$HOME/.chaos-home"
+mkdir -p "$chaos_data/.chaos" "$chaos_data/.codex"
+
+SCRIPT_HASH=$(md5sum "$SCRIPT_PATH" | cut -d' ' -f1)
+BUILD_KEY="${SCRIPT_HASH}:${CHAOS_REF}"
+
+NEEDS_BUILD=false
+if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
+    echo "Image '$IMAGE_NAME' not found. Building..."
+    NEEDS_BUILD=true
+elif [ "$FORCE_REBUILD" = true ] || [ "$NO_CACHE" = true ]; then
+    NEEDS_BUILD=true
+else
+    STORED=$(docker image inspect "$IMAGE_NAME" --format '{{index .Config.Labels "chaos.build.key"}}' 2>/dev/null || true)
+    [ "$STORED" != "$BUILD_KEY" ] && { echo "Build inputs changed. Rebuilding..."; NEEDS_BUILD=true; }
+fi
+
+if [ "$NEEDS_BUILD" = true ]; then
+    BUILD_DIR=$(mktemp -d)
+    cat > "$BUILD_DIR/Dockerfile" <<'DOCKERFILE'
+FROM rust:1.94-bookworm AS builder
+ARG CHAOS_REF=master
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git ca-certificates pkg-config libssl-dev clang libdbus-1-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+RUN git clone https://github.com/seuros/chaos.git
+WORKDIR /src/chaos
+RUN git checkout "$CHAOS_REF"
+RUN git submodule update --init --recursive || \
+    echo "WARN: submodule update failed; continuing without submodules"
+RUN cargo build --release -p chaos-cli --bin chaos
+RUN cp target/release/chaos /usr/local/bin/chaos
+
+FROM node:22-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git jq libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+# Claude Code is installed because Chaos shells out to it for Claude MAX auth.
+RUN npm install -g @anthropic-ai/claude-code
+COPY --from=builder /usr/local/bin/chaos /usr/local/bin/chaos
+WORKDIR /workspace
+CMD ["chaos"]
+DOCKERFILE
+
+    BUILD_ARGS=(
+      --build-arg "CHAOS_REF=$CHAOS_REF"
+      --label "chaos.build.key=$BUILD_KEY"
+      -t "$IMAGE_NAME"
+    )
+    [ "$NO_CACHE" = true ] && BUILD_ARGS+=(--no-cache)
+    docker build "${BUILD_ARGS[@]}" "$BUILD_DIR"
+    rm -rf "$BUILD_DIR"
+fi
+
+TTY_FLAGS=(-i)
+[ -t 0 ] && [ -t 1 ] && TTY_FLAGS+=(-t)
+
+DOCKER_ARGS=(
+  "${TTY_FLAGS[@]}" --rm
+  --user "$(id -u):$(id -g)"
+  --cap-drop=ALL
+  --security-opt=no-new-privileges
+  --label "hostdir=$HOST_PWD"
+  -v "$HOST_PWD:$HOST_PWD"
+  -v "$claude_data/.claude:/home/node/.claude"
+  -v "$claude_data/.claude.json:/home/node/.claude.json"
+  -v "$chaos_data/.chaos:/home/node/.chaos"
+  -v "$chaos_data/.codex:/home/node/.codex"
+  -w "$HOST_PWD"
+  -e HOME=/home/node
+  -e CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1
+  -e CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+  -e DISABLE_AUTOUPDATER=1
+)
+for env_var in "${ENV_VARS[@]}"; do
+    DOCKER_ARGS+=(-e "$env_var")
+done
+
+# Forward host Anthropic credentials into the container when present.
+# Intentionally do not forward ANTHROPIC_API_KEY by default so Chaos prefers
+# clamped Claude Code MAX auth when available.
+for k in ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL; do
+    if [ -n "${!k:-}" ]; then
+        DOCKER_ARGS+=(-e "$k=${!k}")
+    fi
+done
+
+if [ "$SHELL_MODE" = true ]; then
+    exec docker run "${DOCKER_ARGS[@]}" "$IMAGE_NAME" bash
+fi
+
+CHAOS_CMD=(chaos)
+[ "$SAFE_MODE" = false ] && CHAOS_CMD+=(--dangerously-bypass-approvals-and-sandbox)
+
+if [ ${#PASSTHROUGH_ARGS[@]} -gt 0 ]; then
+    exec docker run "${DOCKER_ARGS[@]}" "$IMAGE_NAME" "${CHAOS_CMD[@]}" "${PASSTHROUGH_ARGS[@]}"
+else
+    exec docker run "${DOCKER_ARGS[@]}" "$IMAGE_NAME" "${CHAOS_CMD[@]}"
+fi
