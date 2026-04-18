@@ -1,0 +1,16 @@
+services:
+  # Simple web service that responds on port 8080.
+  # claude-jail auto-attaches to this service's network when launched from
+  # the same directory, so `curl http://test-web:8080` works from inside
+  # the jail. See README.md "Testing compose-network access".
+  test-web:
+    image: alpine:3.19
+    container_name: claude-test-web
+    command:
+      - sh
+      - -c
+      - |
+        echo 'Web server running' &&
+        while true; do
+          echo -e 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK' | nc -l -p 8080
+        done
