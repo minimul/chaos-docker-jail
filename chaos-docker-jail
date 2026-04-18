@@ -97,7 +97,7 @@ RUN cp target/release/chaos /usr/local/bin/chaos
 
 FROM node:22-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl git jq libssl3 gnupg \
+        ca-certificates curl git jq libssl3 libdbus-1-3 gnupg \
     && rm -rf /var/lib/apt/lists/*
 # Install the Docker CLI + compose plugin from Docker's official repo.
 RUN apt-get update \
